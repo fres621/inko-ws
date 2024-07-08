@@ -1,0 +1,242 @@
+# WebSocket
+# 
+# @warning this is WIP and not ready for production, everything in here is subject to change.
+import base64 (Base64)
+import dataview (Reader, Writer)
+import requests (HTTPMethod, HTTPRequest, HTTPResponse, URL, host_by_name)
+import std.int (MAX)
+import std.io (Error, Read, Write)
+import std.net.socket (TcpClient)
+import std.rand (Random)
+import std.time (Duration)
+
+class pub WSMessage {
+  let pub @opcode: Int
+  let pub @mask: Option[ByteArray]
+  let pub @message: ByteArray
+}
+
+# A parser for WebSocket messages which you can "feed" the raw data to
+class pub WSMessageParser {
+  let @bytes: ByteArray
+  let @opcode: Int
+  let @length: Int
+
+  fn mut clear {
+    @bytes.clear
+    @opcode = 0
+    @length = 0
+  }
+
+  fn pub static make_packet(data: ByteArray) -> ByteArray {
+    # Masking. Should be random but for now we fix it to 196
+    let masked = ByteArray.new
+
+    data.iter.each(fn (byte) { masked.push(byte ^ 196) })
+
+    let length = data.size
+
+    let mut meta = ByteArray.filled(0, 2)
+    let mut start = 2
+
+    meta.set(0, 129)
+    meta.set(1, 128)
+
+    if length >= 126 {
+      meta.set(1, meta.get(1) + 126)
+
+      let writer = Writer(meta)
+
+      writer.writeShort(length)
+      meta = writer.into_byte_array
+      meta.resize(8, 0)
+      start = 4
+    } else {
+      meta.resize(6, 0)
+      meta.set(1, meta.get(1) + length)
+    }
+
+    4.times(fn (i) { meta.set(i + start, 196) })
+    meta.append(masked)
+    meta
+  }
+
+  # You can feed data and it'll return a Message once it gets a whole message
+  # It'll return Option.None when fed with incomplete chunks
+  fn pub mut feed(data: ByteArray) -> Option[WSMessage] {
+    # Logic for parsing the WebSocket headers if it's the first chunk
+    if @bytes.size == 0 {
+      let reader = Reader.new(data)
+
+      @opcode = reader.getByte(0) & 0x0F
+
+      let fin = 1 # (reader.getByte(0) & 0x80) & 7 # TODO
+      let thing = reader.getByte(1) & 0x7f
+
+      @length = match thing {
+        case 126 -> reader.getUint16BE(2)
+        case 127 -> reader.getUint64BE(2)
+        case _ -> thing
+      }
+
+      let start = match thing {
+        case 126 -> 4
+        case 127 -> 12
+        case _ -> 2
+      }
+      let payload = reader.bytes.slice(start, @length)
+
+      if fin > 0 {
+        let message = WSMessage(@opcode, Option.None, payload)
+
+        self.clear
+        Option.Some(message)
+      } else {
+        @bytes.append(payload)
+        Option.None
+      }
+    } else {
+      @bytes.append(data)
+      # No idea on the - 2, still testing
+      if @bytes.size == (@length - 2) {
+        let message = WSMessage(@opcode, Option.None, @bytes.clone)
+
+        self.clear
+        Option.Some(message)
+      } else {
+        Option.None
+      }
+    }
+  }
+
+  fn pub static new -> WSMessageParser {
+    WSMessageParser(ByteArray.new, 0, 0)
+  }
+}
+
+# trait Stream: Write + Read {}
+fn pub make_request(url: URL, key: ByteArray) -> HTTPRequest {
+  let request = HTTPRequest.new(HTTPMethod.GET, path: url.pathname)
+
+  request.set_header('Host', url.host)
+  request.set_header('user-agent', 'inko-ws/1.0.0')
+  request.set_header('Sec-WebSocket-Version', '13')
+  request.set_header('Sec-WebSocket-Key', Base64.encode_bytes(key.clone))
+  request.set_header('Connection', 'Upgrade')
+  request.set_header('Upgrade', 'websocket')
+  # We might not want to deal with compression "permessage-deflate"
+  request.set_header(
+    'Sec-WebSocket-Extensions',
+    'permessage-deflate; client_max_window_bits',
+  )
+  request
+}
+
+trait pub Timeoutable {
+  # TODO We could support up to micros
+  fn pub mut set_timeout(ms: Int)
+}
+
+# With this approach we make a wrapper for std::TcpClient to implement our timeout trait
+class pub WTcpClient {
+  let @client: TcpClient
+}
+
+impl Read for WTcpClient {
+  fn pub mut read(into: mut ByteArray, size: Int) -> Result[Int, Error] {
+    @client.read(into, size)
+  }
+}
+
+impl Write for WTcpClient {
+  fn pub mut write_bytes(bytes: ref ByteArray) -> Result[Nil, Error] {
+    @client.write_bytes(bytes)
+  }
+
+  fn pub mut write_string(string: String) -> Result[Nil, Error] {
+    @client.write_string(string)
+  }
+
+  fn pub mut flush -> Result[Nil, Error] {
+    @client.flush
+  }
+}
+
+impl Timeoutable for WTcpClient {
+  fn pub mut set_timeout(ms: Int) {
+    @client.socket.timeout_after = Duration.from_millis(ms)
+  }
+}
+
+class pub WebSocket[T: mut + Read + Timeoutable + Write] {
+  let @url: URL
+  let pub @client: T
+
+  # The initial response received by the server
+  let @handshake: HTTPResponse
+
+  fn pub mut wait_for_message(timeout: Option[Int]) -> Option[ByteArray] {
+    if timeout.some? {
+      @client.set_timeout(timeout.get)
+    } else {
+      # TODO is this the best practice?
+      @client.set_timeout(MAX)
+    }
+
+    let data = ByteArray.new
+    let state = @client.read(into: data, size: 4096)
+
+    if state.error? { Option.None } else { Option.Some(data) }
+  }
+
+  fn pub mut send(data: ByteArray) {
+    @client.write_bytes(WSMessageParser.make_packet(data))
+  }
+
+  fn pub static new(uri: String) -> WebSocket[WTcpClient] {
+    let url = URL.parse(uri).get
+    let ip = host_by_name(url.hostname).get
+    let port = url.port
+    let key = Random.new.bytes(size: 16)
+    let request = make_request(url, key)
+    let client = WTcpClient(TcpClient.new(ip, port).get)
+
+    client.write_string(request.into_string).get
+
+    let handshake = ByteArray.new
+
+    client.read(into: handshake, size: 1024)
+    WebSocket(
+      URL.parse(uri).get,
+      client,
+      HTTPResponse.parse(handshake.to_string),
+    )
+  }
+
+  fn pub static from_socket[B: mut + Read + Timeoutable + Write](
+    uri: String,
+    socket: B,
+  ) -> WebSocket[B] {
+    let url = URL.parse(uri).get
+    let key = Random.new.bytes(size: 16)
+    let request = make_request(url, key)
+
+    socket.write_string(request.into_string).get
+
+    let handshake = ByteArray.new
+
+    socket.read(into: handshake, size: 1024)
+    WebSocket(
+      URL.parse(uri).get,
+      socket,
+      HTTPResponse.parse(handshake.to_string),
+    )
+  }
+
+  fn pub static from_tcp_client(
+    uri: String,
+    client: TcpClient,
+  ) -> WebSocket[WTcpClient] {
+    from_socket(uri, WTcpClient(client))
+  }
+}

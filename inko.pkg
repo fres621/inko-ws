@@ -1,0 +1,3 @@
+require https://github.com/fres621/inko-dataview 1.0.3 3351f1c786d3ffd6e89a5973100ccda5305d2973
+require https://github.com/fres621/inko-base64 1.0.0 8eabf23c790992072d5d0eab24806257c03adbcd
+require https://github.com/fres621/inko-requests 1.0.1 9ba42fef62ba0345a7d84e67057f9eba2b9095e0
